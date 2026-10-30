@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Phase 1 — AI Bill Analytics</title>
 </head>
 <body>
 
