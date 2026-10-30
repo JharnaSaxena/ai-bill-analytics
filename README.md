@@ -3,37 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <title>Phase 1 — AI Bill Analytics</title>
-<style>
-  :root { --ink:#111; --muted:#555; --rule:#bbb; --bg:#fff; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: "Georgia", "Times New Roman", serif;
-    color: var(--ink); background: var(--bg);
-    max-width: 820px; margin: 40px auto; padding: 0 24px;
-    line-height: 1.55; font-size: 16px;
-  }
-  header { text-align: center; border-bottom: 1px solid var(--rule); padding-bottom: 22px; margin-bottom: 26px; }
-  header h1 { font-size: 26px; margin: 0 0 6px; }
-  header h2 { font-size: 17px; font-weight: normal; font-style: italic; margin: 0 0 18px; color: var(--muted); }
-  header .meta { font-size: 14px; line-height: 1.9; }
-  header .meta span { display: block; }
-  h2.section { font-size: 19px; margin-top: 34px; margin-bottom: 10px; border-bottom: 1px solid var(--rule); padding-bottom: 4px; }
-  h3 { font-size: 15px; margin-top: 22px; margin-bottom: 6px; }
-  p { margin: 8px 0; text-align: justify; }
-  ul, ol { margin: 8px 0 8px 22px; padding: 0; }
-  li { margin: 4px 0; }
-  code { font-family: "Consolas", "Courier New", monospace; font-size: 13.5px; background: #f3f3f6; padding: 1px 4px; border-radius: 3px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 12px 0; }
-  th, td { border-top: 1px solid #999; border-bottom: 1px solid #999; padding: 6px 8px; text-align: left; vertical-align: top; }
-  th { background: #f6f6f8; font-weight: 600; }
-  tr:last-child td { border-bottom: 1px solid #999; }
-  figure { margin: 20px 0; text-align: center; }
-  figure img { max-width: 100%; border: 1px solid var(--rule); }
-  figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; text-align: justify; }
-  a { color: #1a4fa0; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .note { font-size: 14px; color: var(--muted); font-style: italic; }
-</style>
 </head>
 <body>
 
