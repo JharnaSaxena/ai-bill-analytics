@@ -62,7 +62,7 @@ flowchart TD
         PG_SPEED --> VIEWS
         VIEWS --> GRAFANA
     end
-
+```
 
 ---
 
