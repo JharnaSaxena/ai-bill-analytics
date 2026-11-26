@@ -13,55 +13,50 @@ End-to-end **Lambda Architecture** deployment on AWS for multi-tenant LLM token 
 ## 1. End-to-End Architecture & Intermediate Artifacts Flowchart
 ```mermaid
 flowchart TD
-    %% Ingestion Layer
-    subgraph INGEST["1. Ingestion & Dual-Write Layer (EC2 Compute Node)"]
-        GEN["<b>Event Producer</b><br/><i>producers/producer_and_archiver.py</i><br/>Generates JSON usage events:<br/>event_id, team_id, model, tokens_in, tokens_out, event_ts"]
-        KAFKA["<b>Apache Kafka 3.8.0 (KRaft)</b><br/>Topic: <code>llm-usage-events</code> | Port: <code>9092</code><br/><b>Intermediate Output:</b> Real-time event stream buffer"]
-        GEN -->|Publish JSON event| KAFKA
+    S1["<b>Step 1–2: AWS Lab & S3 Data Lake (us-east-1)</b><br/>Create S3 bucket with 6 prefixes:<br/><code>raw/</code>, <code>curated/</code>, <code>dead_letter/</code>, <code>scripts/</code>, <code>athena-results/</code>, <code>price/</code><br/>Upload <code>price_budget.csv</code> (token rates + team caps)"]
+
+    S2["<b>Step 3–4: EC2 Compute Node Setup</b><br/>Launch <code>t3.medium</code> (2 vCPU, 4 GiB RAM, Amazon Linux 2023)<br/>Security Group: TCP <code>22</code> (SSH) &amp; <code>3000</code> (Grafana)<br/>Install Docker, Compose plugin, <code>boto3</code>, <code>kafka-python</code>, <code>psycopg2</code>"]
+
+    S3["<b>Step 5–6: Local Serving &amp; Messaging Stack (Docker Compose)</b><br/>Start 3 containers on EC2:<br/>1. <b>PostgreSQL 15</b> (<code>:5432</code>) — initializes <code>serving</code> schema &amp; views<br/>2. <b>Apache Kafka 3.8.0 KRaft</b> (<code>:9092</code>) — topic <code>llm-usage-events</code><br/>3. <b>Grafana</b> (<code>:3000</code>) — auto-provisioned 4-panel dashboard"]
+
+    S4["<b>Step 7: Dual-Write Ingestion</b><br/><i>producers/producer_and_archiver.py</i><br/>Generates JSON usage events (<code>event_id, team_id, model, tokens_in, tokens_out, event_ts</code>)"]
+
+    S1 --> S2 --> S3 --> S4
+
+    subgraph BATCH["Step 8: Batch Layer (Historical Accuracy)"]
+        B1["<b>S3 Raw Archive</b><br/><code>s3://&lt;BUCKET&gt;/raw/dt=YYYY-MM-DD/hour=HH/*.jsonl</code><br/><i>Intermediate Output:</i> Immutable raw JSONL event logs"]
+        B2["<b>AWS Glue 4.0 ETL Job (PySpark)</b><br/><i>jobs/glue_batch_etl.py</i> | 2x <code>G.1X</code> workers<br/>Deduplicates <code>event_id</code>, validates tokens &ge; 0, joins pricing"]
+        B3["<b>Dead-Letter Queue (DLQ)</b><br/><code>s3://&lt;BUCKET&gt;/dead_letter/</code><br/><i>Intermediate Output:</i> Invalid/negative-token Parquet rows"]
+        B4["<b>Curated Parquet Lake</b><br/><code>curated/events_parquet/</code> &amp; <code>curated/batch_agg_parquet/</code><br/><i>Intermediate Output:</i> Partitioned hourly cost rollups"]
+        B5["<b>Glue Crawler + Amazon Athena</b><br/>Catalog DB <code>ai_bill_db</code> &rarr; SQL audit query<br/><i>Intermediate Output:</i> Verified batch spend per team &amp; model"]
+        B6["<b>PostgreSQL Batch Tables</b><br/><i>sync_batch_to_pg.py</i> &rarr; <code>serving.batch_agg</code> &amp; <code>serving.batch_meta</code><br/><i>Intermediate Output:</i> Historical totals + <code>cutoff_ts</code> watermark"]
+
+        B1 --> B2
+        B2 -->|Malformed rows| B3
+        B2 -->|Clean rows| B4
+        B4 --> B5 --> B6
     end
 
-    %% Raw Storage
-    subgraph S3_RAW["2. Raw Data Lake (Amazon S3 - us-east-1)"]
-        RAW_OBJ["<b>Raw Partitioned Archive</b><br/><code>s3://&lt;BUCKET&gt;/raw/dt=YYYY-MM-DD/hour=HH/*.jsonl</code><br/><b>Intermediate Output:</b> Immutable raw JSONL batches"]
-        PRICE_OBJ["<b>Pricing & Budget Reference</b><br/><code>s3://&lt;BUCKET&gt;/price/price_budget.csv</code><br/>Rates per 1K tokens + team monthly limits"]
-        GEN -->|Archive raw batch| RAW_OBJ
+    subgraph SPEED["Step 9a: Speed Layer (Sub-Minute Latency)"]
+        SP1["<b>Kafka Topic: llm-usage-events</b><br/><i>Intermediate Output:</i> Live streaming event buffer"]
+        SP2["<b>Real-Time Speed Consumer</b><br/><i>jobs/run_lambda_speed.py</i> / <i>demo_runner.py</i><br/>Deduplicates <code>event_id</code>, computes cost, buckets by minute"]
+        SP3["<b>PostgreSQL Speed Tables</b><br/><code>serving.speed_agg</code> &amp; <code>serving.speed_cumulative</code><br/><i>Intermediate Output:</i> Live per-minute spend &amp; running totals"]
+
+        SP1 --> SP2 --> SP3
     end
 
-    %% Batch Layer
-    subgraph BATCH["3. Batch Layer (Serverless AWS Glue & Athena)"]
-        GLUE_JOB["<b>AWS Glue 4.0 ETL Job (PySpark)</b><br/><i>jobs/glue_batch_etl.py</i> | 2x G.1X Workers<br/>Deduplicates event_id, validates tokens &ge; 0, joins rates"]
-        DLQ["<b>Dead-Letter Queue (DLQ)</b><br/><code>s3://&lt;BUCKET&gt;/dead_letter/</code><br/><b>Intermediate Output:</b> Malformed/negative-token Parquet rows"]
-        CURATED["<b>Curated Parquet Datasets</b><br/><code>s3://&lt;BUCKET&gt;/curated/events_parquet/</code><br/><code>s3://&lt;BUCKET&gt;/curated/batch_agg_parquet/</code><br/><b>Intermediate Output:</b> Hourly team/model cost rollups"]
-        CRAWLER["<b>AWS Glue Crawler</b><br/>Database: <code>ai_bill_db</code><br/><b>Intermediate Output:</b> External table schemas in Glue Data Catalog"]
-        ATHENA["<b>Amazon Athena</b><br/>Results: <code>s3://&lt;BUCKET&gt;/athena-results/</code><br/><b>Intermediate Output:</b> Audited SQL batch cost reports"]
+    S4 -->|Archive JSONL| B1
+    S4 -->|Publish JSON| SP1
 
-        RAW_OBJ --> GLUE_JOB
-        PRICE_OBJ --> GLUE_JOB
-        GLUE_JOB -->|Invalid records| DLQ
-        GLUE_JOB -->|Valid records| CURATED
-        CURATED --> CRAWLER
-        CRAWLER --> ATHENA
+    subgraph SERVE["Step 9b: Unified Serving &amp; Live Visualization"]
+        V1["<b>Unified SQL Views (PostgreSQL)</b><br/><code>serving.merged_view</code>: Batch (&le; <code>cutoff_ts</code>) + Speed (&gt; <code>cutoff_ts</code>)<br/><code>serving.budget_status</code>: Evaluates <code>ok</code> / <code>warning</code> (&ge;80%) / <code>critical</code> (&ge;100%)"]
+        V2["<b>Grafana Live Dashboard (<code>http://&lt;EC2_IP&gt;:3000</code>)</b><br/>Refreshes every <code>5s</code>:<br/>&bull; Batch vs Stream Table &bull; MTD Budget Alerts<br/>&bull; Real-Time Cost/Min Chart &bull; Spend by LLM Model"]
+
+        V1 --> V2
     end
 
-    %% Speed Layer
-    subgraph SPEED["4. Speed Layer (Real-Time Stream Consumer)"]
-        CONSUMER["<b>Kafka Speed Consumer</b><br/><i>jobs/run_lambda_speed.py</i><br/>In-flight event_id deduplication + per-minute windowing"]
-        KAFKA -->|Consume live stream| CONSUMER
-    end
-
-    %% Serving & Visualization
-    subgraph SERVING["5. Unified Serving & Visualization Layer (EC2 Docker Stack)"]
-        PG_BATCH["<b>PostgreSQL Serving: Batch Tables</b><br/><code>serving.batch_agg</code> &amp; <code>serving.batch_meta</code><br/><b>Intermediate Output:</b> Historical totals + <code>cutoff_ts</code> watermark"]
-        PG_SPEED["<b>PostgreSQL Serving: Speed Tables</b><br/><code>serving.speed_agg</code> &amp; <code>serving.speed_cumulative</code><br/><b>Intermediate Output:</b> Minute-level spend &amp; running totals"]
-        VIEWS["<b>Unified SQL Views</b><br/><code>serving.merged_view</code> (Batch &le; cutoff_ts + Speed &gt; cutoff_ts)<br/><code>serving.budget_status</code> (ok / warning &ge;80% / critical &ge;100%)"]
-        GRAFANA["<b>Grafana Live Dashboard</b><br/>Port: <code>3000</code> | Auto-refresh: <code>5s</code><br/>4 Panels: Batch vs Stream, Budget Alerts, Cost/Min, Model Share"]
-
-        ATHENA -->|Sync batch summary| PG_BATCH
-        CONSUMER -->|Upsert live windows| PG_SPEED
-        PG_BATCH --> VIEWS
-        PG_SPEED --> VIEWS
-        VIEWS --> GRAFANA
-    end
+    B6 --> V1
+    SP3 --> V1
 ```
 
 ---
