@@ -50,13 +50,12 @@ ai-bill-analytics/
 
 ```markdown
 ## Quickstart & Setup Guide
-
 ### 1. Clone Repository & Export Environment Variables
 
-Replace `<YOUR_GIT_REPO_URL>` with your repository URL if cloning fresh, or work directly inside your local checkout:
+Clone the repository and configure your environment variables:
 
 ```bash
-git clone <YOUR_GIT_REPO_URL> ~/ai-bill
+git clone [https://github.com/JharnaSaxena/ai-bill-analytics.git](https://github.com/JharnaSaxena/ai-bill-analytics.git) ~/ai-bill
 cd ~/ai-bill
 
 export AWS_REGION="us-east-1"
@@ -66,9 +65,8 @@ export GLUE_JOB_NAME="ai-bill-batch-etl"
 export CRAWLER_NAME="ai-bill-curated-crawler"
 export EC2_PUBLIC_IP="$(curl -s [http://169.254.169.254/latest/meta-data/public-ipv4](http://169.254.169.254/latest/meta-data/public-ipv4) || echo '127.0.0.1')"
 
-echo "BUCKET_NAME=$BUCKET_NAME | REGION=$AWS_REGION | EC2_IP=$EC2_PUBLIC_IP"
+echo "BUCKET_NAME=$BUCKET_NAME | REGION=$AWS_REGION \vert{} EC2_IP=$EC2_PUBLIC_IP"
 mkdir -p data/price sql scripts grafana/provisioning/datasources grafana/provisioning/dashboards grafana/dashboards
-
 ```
 
 ---
