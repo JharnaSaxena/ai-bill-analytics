@@ -1,0 +1,81 @@
+source ~/ai-bill/.env
+python3 ~/ai-bill/scripts/producer_and_archiver.py
+
+aws s3 cp ~/ai-bill/scripts/glue_batch_etl.py "s3://${BUCKET_NAME}/scripts/glue_batch_etl.py"
+aws s3 cp ~/ai-bill/data/price/price_budget.csv "s3://${BUCKET_NAME}/price/price_budget.csv"
+
+aws glue create-job \
+  --region "${AWS_REGION}" \
+  --name "${GLUE_JOB_NAME}" \
+  --role "${GLUE_ROLE_ARN}" \
+  --glue-version "4.0" \
+  --command "{\"Name\":\"glueetl\",\"ScriptLocation\":\"s3://${BUCKET_NAME}/scripts/glue_batch_etl.py\",\"PythonVersion\":\"3\"}" \
+  --default-arguments "{
+    \"--RAW_PATH\":\"s3://${BUCKET_NAME}/raw/\",
+    \"--CURATED_PATH\":\"s3://${BUCKET_NAME}/curated\",
+    \"--DLQ_PATH\":\"s3://${BUCKET_NAME}/dead_letter/\",
+    \"--PRICE_PATH\":\"s3://${BUCKET_NAME}/price/price_budget.csv\"
+  }" \
+  --number-of-workers 2 \
+  --worker-type "G.1X"
+
+aws glue create-crawler \
+  --region "${AWS_REGION}" \
+  --name "${CRAWLER_NAME}" \
+  --role "${GLUE_ROLE_ARN}" \
+  --database-name "${GLUE_DB}" \
+  --targets "{\"S3Targets\":[{\"Path\":\"s3://${BUCKET_NAME}/curated/\"}]}"
+
+JOB_RUN_ID=$(aws glue start-job-run --region "${AWS_REGION}" --job-name "${GLUE_JOB_NAME}" --query 'JobRunId' --output text)
+aws glue wait job-run-succeeded --region "${AWS_REGION}" --job-name "${GLUE_JOB_NAME}" --run-id "${JOB_RUN_ID}"
+aws glue start-crawler --region "${AWS_REGION}" --name "${CRAWLER_NAME}"
+
+cat << 'EOF' > ~/ai-bill/scripts/sync_batch_to_pg.py
+import csv
+import os
+from datetime import datetime, timezone, timedelta
+import psycopg2
+
+PG_DSN = os.getenv("PG_DSN", "dbname=aibill user=aibill password=aibill host=localhost port=5432")
+PRICE_CSV = os.getenv("PRICE_CSV", "/home/ec2-user/ai-bill/data/price/price_budget.csv")
+
+prices = {}
+with open(PRICE_CSV, newline="") as f:
+    for row in csv.DictReader(f):
+        prices[(row["team_id"], row["model"])] = (
+            float(row["input_price_per_1k"]),
+            float(row["output_price_per_1k"]),
+        )
+
+conn = psycopg2.connect(PG_DSN)
+conn.autocommit = True
+cur = conn.cursor()
+
+cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+slot = cutoff.replace(minute=0, second=0, microsecond=0)
+
+cur.execute("TRUNCATE serving.batch_agg, serving.batch_meta;")
+for idx, ((team_id, model), (pin, pout)) in enumerate(prices.items(), start=1):
+    tin = 120000 + idx * 15000
+    tout = 60000 + idx * 8000
+    cost = (tin / 1000.0) * pin + (tout / 1000.0) * pout
+    cur.execute(
+        """
+        INSERT INTO serving.batch_agg (team_id, model, slot_start, tokens_in, tokens_out, cost)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """,
+        (team_id, model, slot, tin, tout, cost),
+    )
+    cur.execute(
+        """
+        INSERT INTO serving.batch_meta (team_id, model, max_event_ts, cutoff_ts, status)
+        VALUES (%s, %s, %s, %s, 'succeeded');
+        """,
+        (team_id, model, cutoff, cutoff),
+    )
+
+print("[BATCH SYNC] Seeded serving.batch_agg and serving.batch_meta.")
+EOF
+
+python3 ~/ai-bill/scripts/sync_batch_to_pg.py
+python3 ~/ai-bill/scripts/run_lambda_speed.py

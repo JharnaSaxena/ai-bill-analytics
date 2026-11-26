@@ -1,0 +1,223 @@
+cat << 'EOF' > ~/ai-bill/scripts/producer_and_archiver.py
+import json
+import os
+import random
+import uuid
+from datetime import datetime, timezone
+import boto3
+from kafka import KafkaProducer
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+TOPIC = os.getenv("KAFKA_TOPIC", "llm-usage-events")
+BUCKET = os.environ["BUCKET_NAME"]
+REGION = os.getenv("AWS_REGION", "us-east-1")
+
+s3 = boto3.client("s3", region_name=REGION)
+producer = KafkaProducer(
+    bootstrap_servers=KAFKA_BOOTSTRAP,
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+)
+
+teams = ["team-a", "team-b", "team-c"]
+models = ["gpt-4o", "claude-sonnet-4", "gpt-4o-mini"]
+
+
+def generate_event(spike: bool = False) -> dict:
+    mult = 30 if spike else 1
+    return {
+        "event_id": str(uuid.uuid4()),
+        "team_id": "team-c" if spike else random.choice(teams),
+        "model": "gpt-4o" if spike else random.choice(models),
+        "tokens_in": random.randint(5000, 25000) * mult,
+        "tokens_out": random.randint(2500, 15000) * mult,
+        "event_ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def emit_batch(n: int = 100, spike: bool = False):
+    records = [generate_event(spike=spike) for _ in range(n)]
+    for evt in records:
+        producer.send(TOPIC, evt)
+    producer.flush()
+
+    now = datetime.now(timezone.utc)
+    key = f"raw/dt={now:%Y-%m-%d}/hour={now:%H}/events_{int(now.timestamp())}_{uuid.uuid4().hex[:8]}.jsonl"
+    s3.put_object(Bucket=BUCKET, Key=key, Body=("\n".join(json.dumps(r) for r in records) + "\n").encode("utf-8"))
+    print(f"[INGEST] Sent {n} events (spike={spike}) -> Kafka & s3://{BUCKET}/{key}")
+
+
+if __name__ == "__main__":
+    emit_batch(n=120, spike=False)
+EOF
+
+cat << 'EOF' > ~/ai-bill/scripts/run_lambda_speed.py
+import csv
+import json
+import os
+from datetime import datetime
+from kafka import KafkaConsumer
+import psycopg2
+
+PG_DSN = os.getenv("PG_DSN", "dbname=aibill user=aibill password=aibill host=localhost port=5432")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+TOPIC = os.getenv("KAFKA_TOPIC", "llm-usage-events")
+PRICE_CSV = os.getenv("PRICE_CSV", "/home/ec2-user/ai-bill/data/price/price_budget.csv")
+
+prices = {}
+with open(PRICE_CSV, newline="") as f:
+    for row in csv.DictReader(f):
+        prices[(row["team_id"], row["model"])] = (
+            float(row["input_price_per_1k"]),
+            float(row["output_price_per_1k"]),
+            float(row["budget_limit"]),
+        )
+
+conn = psycopg2.connect(PG_DSN)
+conn.autocommit = True
+cur = conn.cursor()
+
+for (team_id, _model), (_, _, limit) in prices.items():
+    cur.execute(
+        """
+        INSERT INTO serving.speed_cumulative (team_id, budget_limit)
+        VALUES (%s, %s)
+        ON CONFLICT (team_id) DO NOTHING;
+        """,
+        (team_id, limit),
+    )
+
+consumer = KafkaConsumer(
+    TOPIC,
+    bootstrap_servers=KAFKA_BOOTSTRAP,
+    group_id="aibill-speed-consumer",
+    enable_auto_commit=False,
+    auto_offset_reset="earliest",
+    consumer_timeout_ms=2500,
+    value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+)
+
+seen_ids = set()
+processed = 0
+
+for msg in consumer:
+    evt = msg.value or {}
+    eid = evt.get("event_id")
+    if not eid or eid in seen_ids:
+        continue
+    seen_ids.add(eid)
+
+    key = (evt.get("team_id"), evt.get("model"))
+    if key not in prices:
+        continue
+
+    tin = int(evt.get("tokens_in", 0))
+    tout = int(evt.get("tokens_out", 0))
+    if tin < 0 or tout < 0:
+        continue
+
+    pin, pout, limit = prices[key]
+    cost = (tin / 1000.0) * pin + (tout / 1000.0) * pout
+    ts = datetime.fromisoformat(evt["event_ts"].replace("Z", "+00:00"))
+    m_start = ts.replace(second=0, microsecond=0)
+
+    cur.execute(
+        """
+        INSERT INTO serving.speed_agg (team_id, model, minute_start, tokens_in, tokens_out, cost)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (team_id, model, minute_start) DO UPDATE SET
+            tokens_in = serving.speed_agg.tokens_in + EXCLUDED.tokens_in,
+            tokens_out = serving.speed_agg.tokens_out + EXCLUDED.tokens_out,
+            cost = serving.speed_agg.cost + EXCLUDED.cost;
+        """,
+        (key[0], key[1], m_start, tin, tout, cost),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO serving.speed_cumulative (
+            team_id, total_tokens_in, total_tokens_out, total_cost, budget_limit, pct_used, alert_status, last_event_ts
+        )
+        VALUES (
+            %s, %s, %s, %s, %s,
+            ROUND(((%s / NULLIF(%s, 0)) * 100)::NUMERIC, 2),
+            CASE
+                WHEN %s >= %s THEN 'critical'
+                WHEN %s >= 0.8 * %s THEN 'warning'
+                ELSE 'ok'
+            END,
+            %s
+        )
+        ON CONFLICT (team_id) DO UPDATE SET
+            total_tokens_in = serving.speed_cumulative.total_tokens_in + EXCLUDED.total_tokens_in,
+            total_tokens_out = serving.speed_cumulative.total_tokens_out + EXCLUDED.total_tokens_out,
+            total_cost = serving.speed_cumulative.total_cost + EXCLUDED.total_cost,
+            pct_used = ROUND((((serving.speed_cumulative.total_cost + EXCLUDED.total_cost) / NULLIF(serving.speed_cumulative.budget_limit, 0)) * 100)::NUMERIC, 2),
+            alert_status = CASE
+                WHEN (serving.speed_cumulative.total_cost + EXCLUDED.total_cost) >= serving.speed_cumulative.budget_limit THEN 'critical'
+                WHEN (serving.speed_cumulative.total_cost + EXCLUDED.total_cost) >= 0.8 * serving.speed_cumulative.budget_limit THEN 'warning'
+                ELSE 'ok'
+            END,
+            last_event_ts = GREATEST(COALESCE(serving.speed_cumulative.last_event_ts, EXCLUDED.last_event_ts), EXCLUDED.last_event_ts);
+        """,
+        (key[0], tin, tout, cost, limit, cost, limit, cost, limit, cost, limit, ts),
+    )
+    processed += 1
+
+consumer.commit()
+consumer.close()
+print(f"[SPEED] Processed {processed} unique Kafka events.")
+EOF
+
+cat << 'EOF' > ~/ai-bill/scripts/glue_batch_etl.py
+import sys
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "RAW_PATH", "CURATED_PATH", "DLQ_PATH", "PRICE_PATH"])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+raw_df = spark.read.json(args["RAW_PATH"])
+prices_df = spark.read.option("header", True).option("inferSchema", True).csv(args["PRICE_PATH"])
+
+valid_df = (
+    raw_df.filter(
+        F.col("event_id").isNotNull()
+        & F.col("team_id").isNotNull()
+        & F.col("model").isNotNull()
+        & (F.col("tokens_in") >= 0)
+        & (F.col("tokens_out") >= 0)
+    )
+    .dropDuplicates(["event_id"])
+    .withColumn("event_ts_parsed", F.to_timestamp("event_ts"))
+    .withColumn("dt", F.date_format("event_ts_parsed", "yyyy-MM-dd"))
+)
+
+invalid_df = raw_df.subtract(valid_df.select(raw_df.columns))
+if invalid_df.limit(1).count() > 0:
+    invalid_df.write.mode("append").parquet(args["DLQ_PATH"])
+
+joined_df = valid_df.join(prices_df, on=["team_id", "model"], how="inner").withColumn(
+    "cost",
+    (F.col("tokens_in") / 1000.0) * F.col("input_price_per_1k")
+    + (F.col("tokens_out") / 1000.0) * F.col("output_price_per_1k"),
+)
+
+joined_df.write.mode("overwrite").partitionBy("dt").parquet(f"{args['CURATED_PATH']}/events_parquet/")
+
+agg_df = (
+    joined_df.withColumn("slot_start", F.date_trunc("hour", "event_ts_parsed"))
+    .groupBy("team_id", "model", "slot_start", "dt")
+    .agg(
+        F.sum("tokens_in").cast("bigint").alias("tokens_in"),
+        F.sum("tokens_out").cast("bigint").alias("tokens_out"),
+        F.sum("cost").cast("decimal(14,6)").alias("cost"),
+    )
+)
+
+agg_df.write.mode("overwrite").partitionBy("dt").parquet(f"{args['CURATED_PATH']}/batch_agg_parquet/")
+EOF

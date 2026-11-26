@@ -1,0 +1,11 @@
+sudo dnf update -y && sudo dnf install -y docker jq python3-pip
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+
+sudo mkdir -p /usr/libexec/docker/cli-plugins
+sudo curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/libexec/docker/cli-plugins/docker-compose
+
+pip3 install --user kafka-python psycopg2-binary boto3
+newgrp docker

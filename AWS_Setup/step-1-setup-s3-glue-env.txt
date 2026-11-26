@@ -1,0 +1,35 @@
+mkdir -p ~/ai-bill/data/price ~/ai-bill/sql ~/ai-bill/scripts \
+         ~/ai-bill/grafana/provisioning/datasources \
+         ~/ai-bill/grafana/provisioning/dashboards \
+         ~/ai-bill/grafana/dashboards
+
+export AWS_REGION="us-east-1"
+export BUCKET_NAME="ai-bill-lambda-$(date +%s)"
+export GLUE_DB="ai_bill_db"
+export GLUE_JOB_NAME="ai-bill-batch-etl"
+export CRAWLER_NAME="ai-bill-curated-crawler"
+# Replace with your lab/account Glue service role ARN if different
+export GLUE_ROLE_ARN=$(aws iam get-role --role-name LabRole --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+cat << EOF > ~/ai-bill/.env
+export AWS_REGION="${AWS_REGION}"
+export BUCKET_NAME="${BUCKET_NAME}"
+export GLUE_DB="${GLUE_DB}"
+export GLUE_JOB_NAME="${GLUE_JOB_NAME}"
+export CRAWLER_NAME="${CRAWLER_NAME}"
+export GLUE_ROLE_ARN="${GLUE_ROLE_ARN}"
+EOF
+source ~/ai-bill/.env
+
+aws s3 mb "s3://${BUCKET_NAME}" --region "${AWS_REGION}"
+for prefix in raw curated dead_letter scripts athena-results price; do
+  aws s3api put-object --bucket "${BUCKET_NAME}" --key "${prefix}/" >/dev/null
+done
+
+aws glue create-database \
+  --region "${AWS_REGION}" \
+  --database-input "{\"Name\":\"${GLUE_DB}\"}"
+
+# If GLUE_ROLE_ARN is empty in your account, set it explicitly:
+echo 'export GLUE_ROLE_ARN="arn:aws:iam::<ACCOUNT_ID>:role/<YOUR_GLUE_ROLE>"' >> ~/ai-bill/.env
+source ~/ai-bill/.env

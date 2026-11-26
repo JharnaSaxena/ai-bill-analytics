@@ -1,0 +1,49 @@
+import os
+import subprocess
+import sys
+import time
+import boto3
+import psycopg2
+
+sys.path.insert(0, "/home/ec2-user/ai-bill/scripts")
+from producer_and_archiver import emit_batch
+
+os.environ.setdefault("AWS_REGION", "us-east-1")
+PG_DSN = os.getenv("PG_DSN", "dbname=aibill user=aibill password=aibill host=localhost port=5432")
+
+
+def show_status():
+    sts = boto3.client("sts", region_name=os.environ["AWS_REGION"])
+    ident = sts.get_caller_identity()
+
+    conn = psycopg2.connect(PG_DSN)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT layer, team_id, COUNT(*) AS rows_cnt, ROUND(SUM(cost)::numeric, 4) AS total_cost
+        FROM serving.merged_view
+        GROUP BY layer, team_id
+        ORDER BY team_id, layer;
+    """)
+    merged_rows = cur.fetchall()
+
+    cur.execute("SELECT team_id, budget_limit, mtd_cost, pct_used, status FROM serving.budget_status ORDER BY pct_used DESC;")
+    budget_rows = cur.fetchall()
+    conn.close()
+
+    print(f"\n[ALIVE CHECK] Account={ident['Account']} | ARN={ident['Arn'].split('/')[-1]}")
+    print("--- Batch + Stream Combined (serving.merged_view) ---")
+    for r in merged_rows:
+        print(f"  layer={r[0]:5s} | team={r[1]:6s} | windows={r[2]:2d} | cost=${r[3]}")
+    print("--- Budget & Alerts (serving.budget_status) ---")
+    for r in budget_rows:
+        print(f"  team={r[0]:6s} | limit=${r[1]} | mtd=${r[2]} | pct={r[3]}% | status={r[4]}")
+
+
+tick = 0
+print("Starting live demo loop (Ctrl+C to stop)...")
+while True:
+    tick += 1
+    emit_batch(n=15, spike=(tick % 4 == 0))
+    subprocess.run(["python3", "/home/ec2-user/ai-bill/scripts/run_lambda_speed.py"], check=True)
+    show_status()
+    time.sleep(5)

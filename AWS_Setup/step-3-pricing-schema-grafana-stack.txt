@@ -1,0 +1,256 @@
+cat << 'EOF' > ~/ai-bill/data/price/price_budget.csv
+team_id,model,input_price_per_1k,output_price_per_1k,budget_limit
+team-a,gpt-4o,0.005,0.015,500.00
+team-a,claude-sonnet-4,0.003,0.015,500.00
+team-a,gpt-4o-mini,0.00015,0.0006,500.00
+team-b,gpt-4o,0.005,0.015,300.00
+team-b,claude-sonnet-4,0.003,0.015,300.00
+team-b,gpt-4o-mini,0.00015,0.0006,300.00
+team-c,gpt-4o,0.005,0.015,200.00
+team-c,claude-sonnet-4,0.003,0.015,200.00
+team-c,gpt-4o-mini,0.00015,0.0006,200.00
+EOF
+
+cat << 'EOF' > ~/ai-bill/sql/init_serving.sql
+CREATE SCHEMA IF NOT EXISTS serving;
+
+CREATE TABLE IF NOT EXISTS serving.batch_agg (
+    team_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    slot_start TIMESTAMPTZ NOT NULL,
+    tokens_in BIGINT NOT NULL,
+    tokens_out BIGINT NOT NULL,
+    cost NUMERIC(14, 6) NOT NULL,
+    PRIMARY KEY (team_id, model, slot_start)
+);
+
+CREATE TABLE IF NOT EXISTS serving.batch_meta (
+    team_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    max_event_ts TIMESTAMPTZ NOT NULL,
+    cutoff_ts TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (team_id, model)
+);
+
+CREATE TABLE IF NOT EXISTS serving.speed_agg (
+    team_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    minute_start TIMESTAMPTZ NOT NULL,
+    tokens_in BIGINT NOT NULL,
+    tokens_out BIGINT NOT NULL,
+    cost NUMERIC(14, 6) NOT NULL,
+    PRIMARY KEY (team_id, model, minute_start)
+);
+
+CREATE TABLE IF NOT EXISTS serving.speed_cumulative (
+    team_id TEXT PRIMARY KEY,
+    total_tokens_in BIGINT NOT NULL DEFAULT 0,
+    total_tokens_out BIGINT NOT NULL DEFAULT 0,
+    total_cost NUMERIC(14, 6) NOT NULL DEFAULT 0,
+    budget_limit NUMERIC(14, 2) NOT NULL,
+    pct_used NUMERIC(8, 2) NOT NULL DEFAULT 0,
+    alert_status TEXT NOT NULL DEFAULT 'ok',
+    last_event_ts TIMESTAMPTZ
+);
+
+CREATE OR REPLACE VIEW serving.merged_view AS
+SELECT
+    team_id,
+    model,
+    slot_start AS window_start,
+    tokens_in,
+    tokens_out,
+    cost,
+    'batch'::TEXT AS layer
+FROM serving.batch_agg
+UNION ALL
+SELECT
+    s.team_id,
+    s.model,
+    s.minute_start AS window_start,
+    s.tokens_in,
+    s.tokens_out,
+    s.cost,
+    'speed'::TEXT AS layer
+FROM serving.speed_agg s
+LEFT JOIN serving.batch_meta m
+    ON s.team_id = m.team_id AND s.model = m.model
+WHERE m.cutoff_ts IS NULL OR s.minute_start > m.cutoff_ts;
+
+CREATE OR REPLACE VIEW serving.budget_status AS
+WITH limits AS (
+    SELECT team_id, MAX(budget_limit) AS budget_limit
+    FROM serving.speed_cumulative
+    GROUP BY team_id
+),
+spend AS (
+    SELECT
+        team_id,
+        COALESCE(SUM(cost), 0) AS mtd_cost
+    FROM serving.merged_view
+    GROUP BY team_id
+)
+SELECT
+    l.team_id,
+    l.budget_limit,
+    ROUND(COALESCE(sp.mtd_cost, 0)::NUMERIC, 4) AS mtd_cost,
+    ROUND(((COALESCE(sp.mtd_cost, 0) / NULLIF(l.budget_limit, 0)) * 100)::NUMERIC, 2) AS pct_used,
+    CASE
+        WHEN COALESCE(sp.mtd_cost, 0) >= l.budget_limit THEN 'critical'
+        WHEN COALESCE(sp.mtd_cost, 0) >= 0.8 * l.budget_limit THEN 'warning'
+        ELSE 'ok'
+    END AS status
+FROM limits l
+LEFT JOIN spend sp ON l.team_id = sp.team_id;
+EOF
+
+cat << 'EOF' > ~/ai-bill/grafana/provisioning/datasources/postgres.yml
+apiVersion: 1
+datasources:
+  - name: AIBill-Postgres
+    type: postgres
+    uid: aibill-pg
+    url: postgres:5432
+    user: aibill
+    secureJsonData:
+      password: aibill
+    jsonData:
+      database: aibill
+      sslmode: disable
+      postgresVersion: 1500
+    isDefault: true
+EOF
+
+cat << 'EOF' > ~/ai-bill/grafana/provisioning/dashboards/default.yml
+apiVersion: 1
+providers:
+  - name: AIBill
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+
+cat << 'EOF' > ~/ai-bill/grafana/dashboards/ai_bill_overview.json
+{
+  "title": "AI Bill Analytics - Live Lambda Serving",
+  "uid": "ai-bill-live",
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Lambda Unified Serving: Batch vs Stream (serving.merged_view)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "postgres", "uid": "aibill-pg"},
+      "targets": [
+        {
+          "rawSql": "SELECT layer, team_id, model, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, ROUND(SUM(cost)::numeric, 4) AS cost_usd FROM serving.merged_view GROUP BY 1, 2, 3 ORDER BY 2, 1, 3;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "MTD Cost vs Budget Alert Status ($)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "postgres", "uid": "aibill-pg"},
+      "targets": [
+        {
+          "rawSql": "SELECT team_id, budget_limit, mtd_cost, pct_used, status FROM serving.budget_status ORDER BY pct_used DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Real-Time Stream Cost per Minute by Team ($)",
+      "type": "timeseries",
+      "gridPos": {"h": 9, "w": 14, "x": 0, "y": 8},
+      "datasource": {"type": "postgres", "uid": "aibill-pg"},
+      "targets": [
+        {
+          "rawSql": "SELECT minute_start AS time, team_id, SUM(cost) AS cost FROM serving.speed_agg GROUP BY 1, 2 ORDER BY 1;",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Total Spend by LLM Model ($)",
+      "type": "piechart",
+      "gridPos": {"h": 9, "w": 10, "x": 14, "y": 8},
+      "datasource": {"type": "postgres", "uid": "aibill-pg"},
+      "targets": [
+        {
+          "rawSql": "SELECT model, ROUND(SUM(cost)::numeric, 4) AS total_cost FROM serving.merged_view GROUP BY 1 ORDER BY 2 DESC;",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+cat << 'EOF' > ~/ai-bill/docker-compose.yml
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: aibill-postgres
+    environment:
+      POSTGRES_DB: aibill
+      POSTGRES_USER: aibill
+      POSTGRES_PASSWORD: aibill
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init_serving.sql:/docker-entrypoint-initdb.d/init_serving.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibill -d aibill"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: aibill-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aibill-grafana
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+
+volumes:
+  pgdata:
+EOF
+
+cd ~/ai-bill && docker compose up -d

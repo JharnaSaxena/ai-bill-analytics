@@ -1,0 +1,6 @@
+source ~/ai-bill/.env
+cd ~/ai-bill && docker compose down -v
+aws glue delete-crawler --region "${AWS_REGION}" --name "${CRAWLER_NAME}" || true
+aws glue delete-job --region "${AWS_REGION}" --job-name "${GLUE_JOB_NAME}" || true
+aws glue delete-database --region "${AWS_REGION}" --name "${GLUE_DB}" || true
+aws s3 rb "s3://${BUCKET_NAME}" --force || true
