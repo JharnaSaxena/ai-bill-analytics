@@ -26,48 +26,26 @@ Think of a bank. The **monthly statement** is accurate but late. The **SMS after
 
 ---
 
-## 3. Logical Architecture
+## 3. Goal Hierarchy and Agent Design
 
-```
-                  ┌──► Raw files (JSONL, never edited) ──► Spark BATCH ──┐
-                  │                                                      │
-LLM usage ──► Producer                                                   ▼
-  events          │                                              PostgreSQL (serving)
-                  └──► Kafka ──► Spark STREAMING ───────────────────────►│
-                                                                         ▼
-                                                       merged_view / budget_status
-                                                                         ▼
-                                                                      Grafana
-```
-
-Everything runs as Docker Compose services: Kafka (topic `llm-usage-events`, 3 partitions, 7-day retention), a Spark master and worker, PostgreSQL and Grafana.
-
----
-
-## 4. Goal Hierarchy and Agent Design
-
-### 4.1 Goal and dependency graph
+### 3.1 Goal and dependency graph
 
 **Top goal (G0):** Give teams and managers an accurate and fresh view of LLM spend, with early budget warnings.
 
 ```
 G0  Accurate + fresh spend view with early warnings
- │
- ├── G1  Capture every usage event safely
- │         │
- │         ├──────────────┐
- │         ▼              ▼
- ├── G2  Accurate      G3  Fresh live numbers
- │       history           and alerts
- │         │              │
- │         └──────┬───────┘
- │                ▼
- └── G4  One merged, read-only view for people
+├── G1  Capture every usage event safely
+├── G2  Accurate history
+├── G3  Fresh live numbers and alerts
+└── G4  One merged, read-only view
+
+Dependencies:  G1 → G2 → G4
+               G1 → G3 → G4
 ```
 
 **Dependencies:** G2 and G3 both need G1. G4 needs both G2 and G3. G1 has no prerequisites.
 
-### 4.2 Functional and interaction objectives (quantified)
+### 3.2 Functional and interaction objectives (quantified)
 
 | Goal | Functional objective (what it must do) | Interaction objective (who it talks to) |
 | --- | --- | --- |
@@ -76,7 +54,7 @@ G0  Accurate + fresh spend view with early warnings
 | **G3 Fresh numbers** | Every 10 seconds: remove duplicates (30 s watermark), validate, price, total per 1-minute window and keep a running total per team. Alert at 80% (`warning`) and 100% (`critical`). Delete speed rows older than the cutoff. | Receive events from Kafka; ask PostgreSQL for budgets and the cutoff; tell PostgreSQL the live totals and alerts. |
 | **G4 One view** | Combine batch rows before the cutoff with speed rows after it. Show budget status as `ok`, `warning` or `critical`. Dashboard refreshes every 10 seconds, read-only. | Grafana asks PostgreSQL every 10 s and shows the answer to managers and teams. |
 
-### 4.3 What each agent does
+### 3.3 What each agent does
 
 | Agent | Serves goal | Duties (quantified) | Output |
 | --- | --- | --- | --- |
@@ -86,7 +64,7 @@ G0  Accurate + fresh spend view with early warnings
 | **Serving agent** (PostgreSQL views) | G4 | 1) Merge batch and speed without overlap. 2) Compute month-to-date cost, `pct_used` and status per team. 3) Give Grafana read-only access. | `merged_view`, `budget_status` |
 | **Dashboard agent** (Grafana) | G4 | 1) Run 8 panel queries every 10 s. 2) Colour thresholds at 80% and 100%. 3) Show batch vs speed on one chart. | Live dashboard |
 
-### 4.4 Sender, receiver, message
+### 3.4 Sender, receiver, message
 
 | # | Sender | Receiver | Message | Type |
 | --- | --- | --- | --- | --- |
@@ -103,9 +81,11 @@ G0  Accurate + fresh spend view with early warnings
 
 ---
 
-## 5. Code Walkthrough (files, functions, constants)
 
-### 5.1 `producers/event_generator.py`: Synthetic Traffic & Fault Simulator
+
+## 4. Code Walkthrough (files, functions, constants)
+
+### 4.1 `producers/event_generator.py`: Synthetic Traffic & Fault Simulator
 
 * **Pricing-Driven Event Generation:** Loads valid `(team_id, model)` pairs from `price_budget.csv` (`load_prices()`) and constructs realistic LLM API usage events (`make_event()`) with unique UUIDs (`event_id`), token counts (`tokens_in`, `tokens_out`), app labels (`APPS`), and response statuses (`STATUSES`).
 * **Off-Hours Back-Dating:** Automatically shifts timestamps outside active operational hours into the `09:00–17:00 UTC` window so batch slot aggregations always receive valid data regardless of when the demo runs.
@@ -113,13 +93,13 @@ G0  Accurate + fresh spend view with early warnings
   * **Late Arrivals (`late_rate=0.02`):** Shifts `2%` of events backward by `30–300 seconds` to stress-test Spark Streaming's `30s` event-time watermark.
   * **Malformed Records (`bad_rate=0.005`):** Corrupts `0.5%` of events (missing `event_id`, negative `tokens_in`, or unknown `model`) to verify validation filters and `serving.dead_letter` routing.
 
-### 5.2 `producers/producer.py`: Dual-Path Lambda Ingestion Dispatcher
+### 4.2 `producers/producer.py`: Dual-Path Lambda Ingestion Dispatcher
 
 * **Dual-Path Fan-Out (`main()`):** Generates synthetic events via `make_event()` at a throttled rate (`RATE_PER_SEC=50`) and dispatches every event with the exact same `event_id` to two independent sinks—first writing to raw disk storage and then publishing to Kafka (`llm-usage-events` with `acks="all"`).
 * **Minute-Level Partitioned Archiving (`MinuteWriter`):** Appends raw JSONL records to Hive-style paths (`year=/month=/day=/hour=/MM.jsonl`), automatically rotating file handles via `_rotate()` whenever the UTC minute changes.
 * **Duplicate Injection & Graceful Shutdown:** Deliberately re-sends `2%` of events (`DUPLICATE_RATE=0.02`) to verify downstream deduplication (`dropDuplicates` in streaming and `T.dedup()` in batch), while trapping `SIGINT`/`SIGTERM` signals to flush Kafka and close open files cleanly via `close()`.
 
-### 5.3 `jobs/transformations.py`: shared logic for batch and stream
+### 4.3 `jobs/transformations.py`: shared logic for batch and stream
 
 | Function / Constant | Code Call | Simple Layman Meaning |
 | :--- | :--- | :--- |
@@ -133,7 +113,7 @@ G0  Accurate + fresh spend view with early warnings
 | **`with_cost(df, prices)`** | `(tokens_in / 1000.0) * input_price_per_1k + (tokens_out / 1000.0) * output_price_per_1k` | Joins events with `prices` on `(model, team_id)` within `[effective_from, effective_to]` and calculates USD cost. |
 | **`current_slot_start_utc()`** | `now = datetime.now(timezone.utc)` → returns `"YYYY-MM-DD 09:00:00"` / `13:00:00` / `17:00:00` | Helper that returns the start timestamp of the current UTC operational slot. |
 
-### 5.4 `jobs/batch_job.py`: the batch agent
+### 4.4 `jobs/batch_job.py`: the batch agent
 
 **Constants**
 - `DATA_DIR` = `/opt/data`, `PRICE_CSV`, `PG_URL`, `PG_PROPS` (database login from environment)
@@ -153,7 +133,7 @@ G0  Accurate + fresh spend view with early warnings
 | **8. Save Batch Tables** | `agg.write` & `watermark.write` | Writes final batch totals to `serving.batch_agg` and updates `cutoff_ts` in `serving.batch_meta`. |
 | **9. Audit Stats** | `stats.write...jdbc("serving.dedup_stats")` | Logs raw vs. deduplicated row counts to prove how many duplicates were caught. |
 
-### 5.5 `jobs/stream_job.py`: the speed agent
+### 4.5 `jobs/stream_job.py`: the speed agent
 
 **Constants**
 - `TRIGGER_SECONDS` = 10 seconds, `WATERMARK` = 30 seconds, `WINDOW` = 1 minute
@@ -171,7 +151,7 @@ G0  Accurate + fresh spend view with early warnings
 | **5. `write_windowed()` & Idle Handling** | `if n == 0: return` + `ON CONFLICT DO UPDATE` + `DELETE ... < cutoff_ts` | Skips empty batches (e.g., idle weekends with 0 events), upserts 1-min buckets into `speed_agg`, and deletes minutes already finalized by Batch. |
 | **6. Query B: Stateful Cumulative** | `priced.groupBy("team_id").agg(F.sum("cost")...)` (`outputMode="complete"`) | Maintains **running team totals** ($S_t = f(S_{t-1}, \Delta E_t)$) across micro-batches, checkpointed in `/opt/checkpoints/stream_cumulative`. |
 | **7. `write_cumulative()` & Alerts** | Joins `team_budget`, detects `80%`/`100%` transitions, upserts `speed_cumulative` | Calculates `% of budget used`, logs `warning_80` or `critical_100` rows to `speed_alerts` only on state transitions, and updates team totals. |
-## 6. Batch Layer
+## 5. Batch Layer
 
 **What it is.** The careful, official calculation. It re-reads **all** raw events every run, so any bug fix or price change can be corrected by simply running it again.
 
@@ -197,11 +177,11 @@ G0  Accurate + fresh spend view with early warnings
 
 ---
 
-## 7. Serving Layer (local PostgreSQL)
+## 6. Serving Layer (local PostgreSQL)
 
 PostgreSQL runs `db/init/01-serving.sql` and then `02-stateful.sql` automatically the first time the container starts. Everything lives in the schema `serving`.
 
-### 7.1 DDL hierarchy
+### 6.1 DDL hierarchy
 
 ```
 serving (schema)
@@ -227,7 +207,7 @@ serving (schema)
 
 Order matters: tables first, then views that read them, then permissions.
 
-### 7.2 Tables
+### 6.2 Tables
 
 **Batch side**
 
@@ -281,7 +261,7 @@ CREATE TABLE serving.dedup_stats (run_at timestamptz DEFAULT now(), layer text,
   raw_count bigint, after_dedup_count bigint, dropped_count bigint);
 ```
 
-### 7.3 Views
+### 6.3 Views
 
 ```sql
 CREATE VIEW serving.merged_view AS
@@ -308,7 +288,7 @@ CREATE VIEW serving.budget_status AS
 - **`budget_status`** adds up this month’s cost from `merged_view` per team: `ok` below 80%, `warning` from 80%, `critical` from 100%. (Shortened here; the real view also rounds and groups.)
 - **`speed_budget_status`** shows only the live stream’s running total.
 
-### 7.4 Access
+### 6.4 Access
 
 ```sql
 CREATE ROLE grafana_ro LOGIN PASSWORD '...';
@@ -321,7 +301,7 @@ Grafana can read everything and change nothing.
 
 ---
 
-## 8. Visualization: Grafana
+## 7. Visualization: Grafana
 
 **Why Grafana.** It is **free, open-source and lightweight**: one small Docker container, no extra database, and a built-in PostgreSQL connector. That suits a live cost monitor on a laptop.
 
