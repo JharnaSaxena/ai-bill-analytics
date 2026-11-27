@@ -113,24 +113,11 @@ G0  Accurate + fresh spend view with early warnings
   * **Late Arrivals (`late_rate=0.02`):** Shifts `2%` of events backward by `30–300 seconds` to stress-test Spark Streaming's `30s` event-time watermark.
   * **Malformed Records (`bad_rate=0.005`):** Corrupts `0.5%` of events (missing `event_id`, negative `tokens_in`, or unknown `model`) to verify validation filters and `serving.dead_letter` routing.
 
-### 5.2 `producers/producer.py`: sends events
+### 5.2 `producers/producer.py`: Dual-Path Lambda Ingestion Dispatcher
 
-**Constants (environment variables)**
-
-- `KAFKA_BOOTSTRAP` = `kafka:29092`, `TOPIC` = `llm-usage-events`
-- `RATE_PER_SEC` = 50, `DURATION_SEC` = 0 (run forever)
-- `DUPLICATE_RATE` = 0.02, `LATE_RATE` = 0.02, `BAD_RATE` = 0.005
-
-**Class `MinuteWriter`**
-
-- `__init__(base)`: sets the raw data folder.
-- `write(ev, ts)`: appends the event to a file in `year=/month=/day=/hour=/MM.jsonl`.
-- `_rotate(key)`: opens a new file when the minute changes.
-- `close()`: closes the open file.
-
-**Function**
-
-- `main()`: loop that writes raw first, then Kafka (`acks="all"`), sometimes sends a duplicate, and stops cleanly on shutdown.
+* **Dual-Path Fan-Out (`main()`):** Generates synthetic events via `make_event()` at a throttled rate (`RATE_PER_SEC=50`) and dispatches every event with the exact same `event_id` to two independent sinks—first writing to raw disk storage and then publishing to Kafka (`llm-usage-events` with `acks="all"`).
+* **Minute-Level Partitioned Archiving (`MinuteWriter`):** Appends raw JSONL records to Hive-style paths (`year=/month=/day=/hour=/MM.jsonl`), automatically rotating file handles via `_rotate()` whenever the UTC minute changes.
+* **Duplicate Injection & Graceful Shutdown:** Deliberately re-sends `2%` of events (`DUPLICATE_RATE=0.02`) to verify downstream deduplication (`dropDuplicates` in streaming and `T.dedup()` in batch), while trapping `SIGINT`/`SIGTERM` signals to flush Kafka and close open files cleanly via `close()`.
 
 ### 5.3 `jobs/transformations.py`: shared logic for batch and stream
 
