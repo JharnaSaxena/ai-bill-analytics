@@ -138,49 +138,56 @@ G0  Accurate + fresh spend view with early warnings
 
 ### 5.3 `jobs/transformations.py`: shared logic for batch and stream
 
-**Constants**
-
-- `USAGE_EVENT_SCHEMA`: the 9 event fields and their types
-- `PRICE_SCHEMA`: columns of the price CSV
-- `SLOT_A_START_HOUR` 9, `SLOT_A_END_HOUR` 13, `SLOT_B_START_HOUR` 13, `SLOT_B_END_HOUR` 17
-
-**Functions**
-
-- `load_prices(spark, path)`: reads the price CSV with proper types and dates.
-- `dedup(df)`: keeps one row per `event_id` and drops rows with no id.
-- `add_slot_start(df)`: labels each event with its 4-hour slot (09:00 or 13:00).
-- `filter_valid(df, prices)`: keeps only good events (used by streaming).
-- `split_valid_invalid(df, prices)`: splits good and bad events and gives each bad one a reason (used by batch).
-- `with_cost(df, prices)`: joins the price valid on the event date and calculates cost.
-- `current_slot_start_utc()`: returns the start of the current slot as text.
-
-**Cost formula:** `tokens_in / 1000 × input_price + tokens_out / 1000 × output_price`
+| Function / Constant | Code Call | Simple Layman Meaning |
+| :--- | :--- | :--- |
+| **`USAGE_EVENT_SCHEMA` & `PRICE_SCHEMA`** | `StructType([...])` | Defines the exact column names and data types (`TimestampType`, `LongType`, `StringType`) for incoming events and the pricing CSV. |
+| **Slot Constants (`09:00`–`17:00`)** | `SLOT_A_START_HOUR = 9`, `SLOT_A_END_HOUR = 13`, `SLOT_B_START_HOUR = 13`, `SLOT_B_END_HOUR = 17` | Defines the two daily 4-hour operational batch windows (`09:00–13:00` and `13:00–17:00` UTC). |
+| **`load_prices(spark, path)`** | `spark.read.option("header", True).schema(PRICE_SCHEMA).csv(path)` | Reads `price_budget.csv` and casts token rates, budget caps, and effective dates into numeric/date types. |
+| **`dedup(df)`** | `df.dropDuplicates(["event_id"]).filter(F.col("event_id").isNotNull())` | Drops rows with missing `event_id` and removes duplicate `event_id`s. |
+| **`add_slot_start(df)`** | `F.when((h >= 9) & (h < 13), "... 09:00:00").when((h >= 13) & (h < 17), "... 13:00:00")` | Buckets each event's timestamp into either the `09:00:00` or `13:00:00` 4-hour batch slot. |
+| **`filter_valid(df, prices)`** | `.filter(tokens >= 0).join(known, on="model", how="left_semi")` | Quickly filters out null timestamps, negative tokens, and unknown models (used by `stream_job.py`). |
+| **`split_valid_invalid(df, prices)`** | Tags `_r1` (`missing_event_id`), `_r2` (`negative_tokens`), `_r3` (`null_ts`), `unknown_model`, `outside_office_hours` | Splits events into `(valid, invalid)` DataFrames and labels every rejected row with its exact `reject_reason` (used by `batch_job.py`). |
+| **`with_cost(df, prices)`** | `(tokens_in / 1000.0) * input_price_per_1k + (tokens_out / 1000.0) * output_price_per_1k` | Joins events with `prices` on `(model, team_id)` within `[effective_from, effective_to]` and calculates USD cost. |
+| **`current_slot_start_utc()`** | `now = datetime.now(timezone.utc)` → returns `"YYYY-MM-DD 09:00:00"` / `13:00:00` / `17:00:00` | Helper that returns the start timestamp of the current UTC operational slot. |
 
 ### 5.4 `jobs/batch_job.py`: the batch agent
 
 **Constants**
-
 - `DATA_DIR` = `/opt/data`, `PRICE_CSV`, `PG_URL`, `PG_PROPS` (database login from environment)
 
-**Function**
+**Execution Stages (`main()`)**
 
-- `main()`: runs 9 numbered stages (read, dedup, validate, dead-letter, price, aggregate, cutoff, write, audit).
+| Step / Function | Code Call | Simple Layman Meaning |
+| :--- | :--- | :--- |
+| **Setup & Prices** | `SparkSession.builder` + `T.load_prices()` | Starts Spark, connects to Postgres, and loads the team token pricing & budget CSV. |
+| **1. Read Raw Logs** | `spark.read.schema(...).json(...)` | Reads all raw JSONL usage files from `/opt/data/raw` (exits early if empty). |
+| **2. Deduplicate** | `T.dedup(raw)` | Removes duplicate `event_id` rows so retries are never billed twice. |
+| **3. Validate Split** | `T.split_valid_invalid()` | Separates clean records from bad ones (negative tokens, unknown models, off-hours). |
+| **4. Dead-Letter Queue** | `dl.write...jdbc("serving.dead_letter")` | Saves rejected rows with their failure reason into `serving.dead_letter` for auditing. |
+| **5. Cost & Time Slot** | `T.with_cost()` + `T.add_slot_start()` | Calculates USD spend per event and assigns each event to its 4-hour batch slot (`09:00` or `13:00`). |
+| **6. Group & Sum** | `priced.groupBy(...).agg(...)` | Totals `tokens_in`, `tokens_out`, and `cost` per team, model, and 4-hour slot. |
+| **7. Cutoff Watermark** | `max_slot = priced.agg(F.max("slot_start"))` | Finds the latest slot start (`cutoff_ts`) so batch and stream never overlap or double-count. |
+| **8. Save Batch Tables** | `agg.write` & `watermark.write` | Writes final batch totals to `serving.batch_agg` and updates `cutoff_ts` in `serving.batch_meta`. |
+| **9. Audit Stats** | `stats.write...jdbc("serving.dedup_stats")` | Logs raw vs. deduplicated row counts to prove how many duplicates were caught. |
 
 ### 5.5 `jobs/stream_job.py`: the speed agent
 
 **Constants**
-
 - `TRIGGER_SECONDS` = 10 seconds, `WATERMARK` = 30 seconds, `WINDOW` = 1 minute
 - `CKPT_WINDOWED`, `CKPT_CUMULATIVE`: checkpoint folders so the job resumes after a restart
 - `KAFKA_BOOTSTRAP`, `TOPIC`, `PRICE_CSV`, `PG_URL`, `PG_PROPS`
 
-**Functions**
+**Execution Pipeline & Functions**
 
-- `write_windowed(batch_df, batch_id)`: saves minute totals into `speed_agg` (update if present, otherwise insert) and deletes rows older than the cutoff.
-- `write_cumulative(batch_df, batch_id)`: updates each team’s running cost and percentage, sets `ok`/`warning`/`critical`, and logs an alert only when the level goes up.
-- `main()`: reads Kafka, parses JSON, removes duplicates, validates, prices, then starts two queries: per-minute totals and running total per team.
-
----
+| Step / Function | Code Call (`stream_job.py`) | Simple Layman Meaning | Engineering Justification (Why We Built It This Way) |
+| :--- | :--- | :--- | :--- |
+| **1. Setup & Live Kafka Read** | `spark.readStream.format("kafka")` + `T.load_prices()` | Starts Spark Streaming, loads the team pricing CSV, and subscribes live to `llm-usage-events` (`startingOffsets="latest"`). | Decouples live ingestion from downstream database writes; `startingOffsets="latest"` prevents replaying stale history on fresh demo starts. |
+| **2. Parse, Watermark & Dedup** | `F.from_json(...)` + `.withWatermark("event_ts", "30 seconds").dropDuplicates(["event_id"])` | Parses raw Kafka bytes into columns, gives late events a 30s grace window, and drops duplicate `event_id`s in flight. | Bounds Spark's in-memory state store (preventing OOM on a 2 GB worker) while eliminating duplicate retries within the live window. |
+| **3. Filter & Price Events** | `T.filter_valid()` + `T.with_cost()` | Keeps only clean events (valid model, positive tokens) and calculates USD spend per event. | Ensures malformed events never corrupt live billing gauges (the Batch layer audits rejected rows separately in `dead_letter`). |
+| **4. Query A: 1-Min Tumbling Window** | `priced.groupBy(F.window("event_ts", "1 minute"), "team_id", "model")` | Groups live traffic into non-overlapping **1-minute tumbling buckets** (sliding = window = `1 min`), triggering every `10s`. | A tumbling window (`slide == window`) prevents an event from falling into multiple buckets and being double-billed; `10s` trigger gives near-real-time UI updates. |
+| **5. `write_windowed()` & Idle Handling** | `if n == 0: return` + `ON CONFLICT DO UPDATE` + `DELETE ... < cutoff_ts` | Skips empty batches (e.g., idle weekends with 0 events), upserts 1-min buckets into `speed_agg`, and deletes minutes already finalized by Batch. | `if n == 0: return` avoids writing `$0.00` filler rows on idle weekends and pauses the watermark safely; `DELETE < cutoff_ts` guarantees zero overlap with Batch. |
+| **6. Query B: Stateful Cumulative** | `priced.groupBy("team_id").agg(F.sum("cost")...)` (`outputMode="complete"`) | Maintains **running team totals** across micro-batches, checkpointed in `/opt/checkpoints/stream_cumulative`. | Enables instant MTD budget tracking ($S_t = f(S_{t-1}, \Delta E_t)$) with fault-tolerant recovery if the container restarts. |
+| **7. `write_cumulative()` & Alerts** | Joins `team_budget`, detects `80%`/`100%` transitions, upserts `speed_cumulative` | Calculates `% of budget used`, logs `warning_80` or `critical_100` rows to `speed_alerts` only on state transitions, and updates team totals. | Transition-only alerting (`ok → warning`, `warning → critical`) prevents alert spam every 10 seconds while keeping dashboard gauges live. |
 
 ## 6. Batch Layer
 
