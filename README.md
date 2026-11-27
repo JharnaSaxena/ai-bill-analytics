@@ -179,16 +179,15 @@ G0  Accurate + fresh spend view with early warnings
 
 **Execution Pipeline & Functions**
 
-| Step / Function | Code Call (`stream_job.py`) | Simple Layman Meaning | Engineering Justification (Why We Built It This Way) |
-| :--- | :--- | :--- | :--- |
-| **1. Setup & Live Kafka Read** | `spark.readStream.format("kafka")` + `T.load_prices()` | Starts Spark Streaming, loads the team pricing CSV, and subscribes live to `llm-usage-events` (`startingOffsets="latest"`). | Decouples live ingestion from downstream database writes; `startingOffsets="latest"` prevents replaying stale history on fresh demo starts. |
-| **2. Parse, Watermark & Dedup** | `F.from_json(...)` + `.withWatermark("event_ts", "30 seconds").dropDuplicates(["event_id"])` | Parses raw Kafka bytes into columns, gives late events a 30s grace window, and drops duplicate `event_id`s in flight. | Bounds Spark's in-memory state store (preventing OOM on a 2 GB worker) while eliminating duplicate retries within the live window. |
-| **3. Filter & Price Events** | `T.filter_valid()` + `T.with_cost()` | Keeps only clean events (valid model, positive tokens) and calculates USD spend per event. | Ensures malformed events never corrupt live billing gauges (the Batch layer audits rejected rows separately in `dead_letter`). |
-| **4. Query A: 1-Min Tumbling Window** | `priced.groupBy(F.window("event_ts", "1 minute"), "team_id", "model")` | Groups live traffic into non-overlapping **1-minute tumbling buckets** (sliding = window = `1 min`), triggering every `10s`. | A tumbling window (`slide == window`) prevents an event from falling into multiple buckets and being double-billed; `10s` trigger gives near-real-time UI updates. |
-| **5. `write_windowed()` & Idle Handling** | `if n == 0: return` + `ON CONFLICT DO UPDATE` + `DELETE ... < cutoff_ts` | Skips empty batches (e.g., idle weekends with 0 events), upserts 1-min buckets into `speed_agg`, and deletes minutes already finalized by Batch. | `if n == 0: return` avoids writing `$0.00` filler rows on idle weekends and pauses the watermark safely; `DELETE < cutoff_ts` guarantees zero overlap with Batch. |
-| **6. Query B: Stateful Cumulative** | `priced.groupBy("team_id").agg(F.sum("cost")...)` (`outputMode="complete"`) | Maintains **running team totals** across micro-batches, checkpointed in `/opt/checkpoints/stream_cumulative`. | Enables instant MTD budget tracking ($S_t = f(S_{t-1}, \Delta E_t)$) with fault-tolerant recovery if the container restarts. |
-| **7. `write_cumulative()` & Alerts** | Joins `team_budget`, detects `80%`/`100%` transitions, upserts `speed_cumulative` | Calculates `% of budget used`, logs `warning_80` or `critical_100` rows to `speed_alerts` only on state transitions, and updates team totals. | Transition-only alerting (`ok → warning`, `warning → critical`) prevents alert spam every 10 seconds while keeping dashboard gauges live. |
-
+| Step / Function | Code Call (`stream_job.py`) | Simple Layman Meaning |
+| :--- | :--- | :--- |
+| **1. Setup & Live Kafka Read** | `spark.readStream.format("kafka")` + `T.load_prices()` | Starts Spark Streaming, loads the team pricing CSV, and subscribes live to `llm-usage-events` (`startingOffsets="latest"`). |
+| **2. Parse, Watermark & Dedup** | `F.from_json(...)` + `.withWatermark("event_ts", "30 seconds").dropDuplicates(["event_id"])` | Parses raw Kafka bytes into columns, gives late events a 30s grace window, and drops duplicate `event_id`s in flight. |
+| **3. Filter & Price Events** | `T.filter_valid()` + `T.with_cost()` | Keeps only clean events (valid model, positive tokens) and calculates USD spend per event. |
+| **4. Query A: 1-Min Tumbling Window** | `priced.groupBy(F.window("event_ts", "1 minute"), "team_id", "model")` | Groups live traffic into non-overlapping **1-minute tumbling buckets** (sliding = window = `1 min`), triggering every `10s`. |
+| **5. `write_windowed()` & Idle Handling** | `if n == 0: return` + `ON CONFLICT DO UPDATE` + `DELETE ... < cutoff_ts` | Skips empty batches (e.g., idle weekends with 0 events), upserts 1-min buckets into `speed_agg`, and deletes minutes already finalized by Batch. |
+| **6. Query B: Stateful Cumulative** | `priced.groupBy("team_id").agg(F.sum("cost")...)` (`outputMode="complete"`) | Maintains **running team totals** ($S_t = f(S_{t-1}, \Delta E_t)$) across micro-batches, checkpointed in `/opt/checkpoints/stream_cumulative`. |
+| **7. `write_cumulative()` & Alerts** | Joins `team_budget`, detects `80%`/`100%` transitions, upserts `speed_cumulative` | Calculates `% of budget used`, logs `warning_80` or `critical_100` rows to `speed_alerts` only on state transitions, and updates team totals. |
 ## 6. Batch Layer
 
 **What it is.** The careful, official calculation. It re-reads **all** raw events every run, so any bug fix or price change can be corrected by simply running it again.
