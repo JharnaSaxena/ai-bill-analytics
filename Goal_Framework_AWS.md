@@ -1,100 +1,86 @@
-# Multi-Agent & Goal Hierarchy — `local_project`
+# Multi-Agent & Goal Hierarchy — AWS Cloud Architecture (`us-east-1`)
 
 ## 1. System Expectations
 
-| Area | Expected behavior | Implementation |
+| Area | Expected Behavior | AWS Implementation |
 |---|---|---|
-| Ingestion | 50 events/sec; each event sent to disk and Kafka with the same `event_id` | `producer.py`, `event_generator.py` |
-| Data quality | 2% duplicates, 2% late events, 0.5% malformed events | `event_generator.py` |
-| Stream processing | 10-second micro-batches; 1-minute windows; 30-second watermark | `stream_job.py` |
-| Batch processing | Recompute history into 4-hour slots (09:00 and 13:00 UTC); update `cutoff_ts` | `batch_job.py` |
-| No double counting | Batch: before `cutoff_ts`; Speed: from `cutoff_ts` onward | `serving.merged_view` |
-| Budget alerts | Team caps: A $500, B $300, C $200; warning at 80%, critical at 100% | `budget_status`, `speed_alerts` |
-| Dashboard | 8 panels; refresh every 10 seconds; read-only database access | Grafana, `grafana_ro` |
+| **Ingestion & Fan-Out** | Emit 15–120 events per tick (with 1-in-4 spike bursts); write each event to S3 and Kafka with the exact same `event_id` | `producer_and_archiver.py` on EC2 (`t3.medium`) |
+| **Data Quality & DLQ** | Filter out null IDs/teams/models and negative token counts (`tokens_in < 0` or `tokens_out < 0`), routing invalid records to `dead_letter/` | `glue_batch_etl.py` (AWS Glue 4.0) & `run_lambda_speed.py` |
+| **Stream Processing** | 5-second micro-batch polling loop (`demo_runner.py`); 1-minute tumbling windows (`minute_start`) and running team spend totals | `run_lambda_speed.py` + Apache Kafka 3.8.0 (KRaft) |
+| **Batch Processing** | Serverless PySpark ETL deduplicating raw JSONL logs, joining pricing rates, writing hourly Parquet rollups (`slot_start`), and cataloging in `ai_bill_db` | AWS Glue 4.0 (`2× G.1X`), Glue Crawler, Amazon Athena, `sync_batch_to_pg.py` |
+| **No Double Counting** | Batch serves `slot_start <= cutoff_ts`; Speed serves `minute_start > cutoff_ts` with zero overlapping records | `serving.merged_view` (PostgreSQL 15) |
+| **Budget Alerts** | Team caps: `team-a` $500, `team-b` $300, `team-c` $200; `warning` at ≥ 80%, `critical` at ≥ 100% | `serving.budget_status` & `serving.speed_cumulative` |
+| **Live Dashboard** | 4 live panels (Batch vs. Stream, MTD Budget Alerts, Cost/Min Timeseries, Spend by Model); auto-refresh every 5 seconds | Grafana (`http://<EC2_PUBLIC_IP>:3000`) |
+
+---
 
 ## 2. Agents and Execution Patterns
 
-| Agent | Component | Main responsibility | Pattern |
+| Agent | AWS Component | Main Responsibility | Execution Pattern |
 |---|---|---|---|
-| **A1 — Ingestion** | Producer | Generate events, inject test anomalies, write to disk and Kafka | Continuous |
-| **A2 — Broker** | Kafka | Buffer events and decouple producers from consumers | Continuous |
-| **A3 — Speed Layer** | Spark Streaming | Create 1-minute aggregates, running totals and budget alerts | Continuous + recursive state updates |
-| **A4 — Batch Layer** | Spark Batch | Read history, deduplicate, reject invalid data, aggregate 4-hour slots and update cutoff | Periodic / one-shot |
-| **A5 — Serving** | PostgreSQL | Store results, enforce uniqueness, merge batch and speed data | Reactive |
-| **A6 — Monitoring** | Grafana | Display metrics and alerts through read-only queries | Periodic polling |
+| **A1 — Ingestion & Archiver** | `producer_and_archiver.py` (EC2 `t3.medium`) | Generate LLM usage events (including spike bursts), archive `.jsonl` files to S3 `raw/`, and publish to Kafka | Continuous (5s loop in `demo_runner.py`) |
+| **A2 — Stream Broker** | Apache Kafka 3.8.0 KRaft (Docker on EC2) | Buffer live events on topic `llm-usage-events` and decouple ingestion from downstream database writes | Continuous |
+| **A3 — Speed Layer** | `run_lambda_speed.py` (EC2 `t3.medium`) | Deduplicate in-flight `event_id`s, compute token costs, bucket into 1-minute windows, and update cumulative team alerts | Continuous + recursive state updates |
+| **A4 — Batch ETL & Catalog** | AWS Glue 4.0 + Glue Crawler + Amazon Athena + `sync_batch_to_pg.py` | Deduplicate full S3 `raw/` history, isolate bad rows in `dead_letter/`, write Snappy Parquet, query via Athena (`ai_bill_db`), and sync `cutoff_ts` | Periodic / one-shot |
+| **A5 — Unified Serving** | PostgreSQL 15 (Docker on EC2) | Store `batch_agg` and `speed_agg`, enforce composite primary keys, and dynamically merge layers at `cutoff_ts` | Reactive |
+| **A6 — Monitoring** | Grafana (`:3000` on EC2) | Query `serving.merged_view` and `serving.budget_status` every 5 seconds to visualize live spend and alerts | Periodic polling |
+
+---
 
 ## 3. Functional vs. Interaction Objectives
 
-**Functional objectives — what each agent does**
-- **A1:** Generate valid LLM usage events and controlled anomalies.
-- **A3:** Filter invalid events, apply watermarking, aggregate windows and maintain running totals.
-- **A4:** Deduplicate history, classify rejected records, calculate slot costs and audit statistics.
-- **A5:** Maintain database consistency, uniqueness and the batch-speed boundary.
+**Functional Objectives — What Each Agent Does Internally**
+- **A1:** Synthesize schema-valid JSON usage events (`event_id`, `team_id`, `model`, `tokens_in`, `tokens_out`, `event_ts`) and partition raw logs by `dt=YYYY-MM-DD/hour=HH`.
+- **A3:** Validate non-negative tokens, join `price_budget.csv`, compute 1-minute aggregates (`speed_agg`), and maintain running team spend and alert flags (`speed_cumulative`).
+- **A4:** Run distributed PySpark `dropDuplicates(["event_id"])`, split invalid records into `s3://<BUCKET>/dead_letter/`, write `batch_agg_parquet`, verify totals in Amazon Athena, and advance `batch_meta.cutoff_ts`.
+- **A5:** Maintain ACID consistency, primary-key idempotency, and the non-overlapping `cutoff_ts` boundary between batch and speed views.
 
-**Interaction objectives — how agents coordinate**
-- **A1 → Disk/Kafka:** Send the same event to both paths with identical IDs and timestamps.
-- **A2 → A3:** Deliver Kafka events and support checkpoint-based recovery.
-- **A3 ↔ A4:** Write to separate tables; coordinate through `batch_meta.cutoff_ts`.
-- **A5 → A6:** Provide reconciled data to Grafana using read-only access.
+**Interaction Objectives — How Agents Coordinate**
+- **A1 → S3 `raw/` & A2 (Kafka):** Fan out every event to both S3 and Kafka with identical `event_id` and `event_ts`.
+- **A2 → A3:** Deliver ordered Kafka messages from `llm-usage-events` with manual offset commits after PostgreSQL upserts succeed.
+- **A3 ↔ A4 via A5:** Isolate writes into separate tables (`speed_agg` vs. `batch_agg`), coordinating handoff solely through `serving.batch_meta.cutoff_ts`.
+- **A5 → A6:** Serve unified, pre-reconciled SQL views (`merged_view`, `budget_status`) to Grafana on port `3000`.
+
+---
 
 ## 4. Sender–Receiver–Message (SRM)
 
-| Sender | Receiver | Channel | Message |
+| Sender | Receiver | AWS Channel / Protocol | Message Payload |
 |---|---|---|---|
-| A1 | Disk | JSONL files | Raw usage events |
-| A1 | A2 | Kafka (`llm-usage-events`) | Same event payload, keyed by `event_id` |
-| A2 | A3 | Spark Kafka source | Events, timestamps and offsets |
-| A3 | A5 | JDBC | `speed_agg`, `speed_cumulative`, `speed_alerts` |
-| Disk | A4 | Spark JSON reader | Historical JSONL data and pricing/budget data |
-| A4 | A5 | JDBC | `batch_agg`, `batch_meta`, `dead_letter`, `dedup_stats` |
-| A5 | A6 | PostgreSQL | Reconciled views, budget status and audit results |
+| **A1** (`producer_and_archiver.py`) | **S3 `raw/`** | AWS SDK (`boto3` HTTPS) | Time-partitioned `.jsonl` files (`dt=.../hour=.../*.jsonl`) |
+| **A1** (`producer_and_archiver.py`) | **A2** (Kafka `:9092`) | TCP Kafka Producer (`llm-usage-events`) | Identical JSON event payload with shared `event_id` |
+| **A2** (Kafka `:9092`) | **A3** (`run_lambda_speed.py`) | TCP Kafka Consumer (`aibill-speed-consumer`) | Uncommitted JSON usage events from `llm-usage-events` |
+| **A3** (`run_lambda_speed.py`) | **A5** (PostgreSQL `:5432`) | PostgreSQL Wire Protocol (`psycopg2`) | Upserts to `serving.speed_agg` and `serving.speed_cumulative` |
+| **S3 `raw/` & `price/`** | **A4** (AWS Glue 4.0) | S3 Connector (PySpark `2× G.1X`) | Raw JSONL event logs + `price_budget.csv` rate table |
+| **A4** (AWS Glue 4.0) | **S3 `curated/` & `dead_letter/`** | S3 Parquet Writer (Snappy) | `events_parquet/`, `batch_agg_parquet/`, and rejected DLQ rows |
+| **A4** (Crawler + Athena + Sync) | **A5** (PostgreSQL `:5432`) | Glue Catalog `ai_bill_db` + `psycopg2` | Verified batch aggregates (`serving.batch_agg`) and `cutoff_ts` (`serving.batch_meta`) |
+| **A5** (PostgreSQL `:5432`) | **A6** (Grafana `:3000`) | Internal Docker Network (`postgres:5432`) | Query results from `serving.merged_view` and `serving.budget_status` |
+
+---
 
 ## 5. Goal Hierarchy
 
 ```mermaid
 graph TD
-    G0["G0: Accurate real-time and historical LLM cost analytics"]
-    G1["G1: Dual-path event ingestion"]
-    G2["G2: Historical batch processing"]
-    G3["G3: Low-latency stream processing"]
-    G4["G4: Unified serving and alerting"]
+    G0["G0: Accurate real-time and historical LLM cost analytics on AWS"]
+    G1["G1: Dual-path cloud event ingestion"]
+    G2["G2: Serverless batch ETL and SQL audit"]
+    G3["G3: Low-latency Kafka stream processing"]
+    G4["G4: Unified serving and live budget alerting"]
 
     G0 --> G1
     G0 --> G2
     G0 --> G3
     G0 --> G4
 
-    G1 --> G11["G1.1: Archive events to disk"]
-    G1 --> G12["G1.2: Publish events to Kafka"]
+    G1 --> G11["G1.1: Archive partitioned JSONL to S3 raw/"]
+    G1 --> G12["G1.2: Publish events to Kafka llm-usage-events"]
 
-    G2 --> G21["G2.1: Deduplicate and reject invalid data"]
-    G2 --> G22["G2.2: Aggregate slots and update cutoff"]
+    G2 --> G21["G2.1: Deduplicate and route invalid rows to S3 dead_letter/"]
+    G2 --> G22["G2.2: Write Parquet, query in Athena, and sync cutoff_ts"]
 
-    G3 --> G31["G3.1: Aggregate 1-minute windows"]
-    G3 --> G32["G3.2: Track cumulative spend and alerts"]
+    G3 --> G31["G3.1: Aggregate 1-minute windows in speed_agg"]
+    G3 --> G32["G3.2: Track cumulative team spend and alerts"]
 
-    G4 --> G41["G4.1: Merge batch and speed data"]
-    G4 --> G42["G4.2: Display read-only Grafana dashboards"]
-```
-
-## 6. Four Rules of a Well-Formed Goal Hierarchy
-
-| Rule | Meaning | Result |
-|---|---|---|
-| **1. Completeness** | Sub-goals together achieve the parent goal | **Pass:** ingestion, batch, stream and serving cover the system goal |
-| **2. Mutual exclusivity** | Sibling goals do not conflict or duplicate outputs | **Pass:** batch handles data before `cutoff_ts`; speed handles data from it onward |
-| **3. Atomicity** | Each leaf goal maps to an executable action and verifiable output | **Pass:** each leaf maps to a script, SQL object or dashboard function |
-| **4. Consistency / non-circularity** | Dependencies form an acyclic graph | **Pass:** data flows from ingestion to processing to serving |
-
-## 7. Execution Pattern Classification
-
-- **Continuous — A1 and A2:** Producer continuously generates events; Kafka continuously buffers them.
-- **Recursive — A3:** Each micro-batch updates the previous checkpointed state:
-
-  \[
-  S_t = f(S_{t-1}, \Delta E_t)
-  \]
-
-  Here, \(S_{t-1}\) is the previous state and \(\Delta E_t\) is the newly received data.
-- **Periodic / one-shot — A4:** Batch processing runs when triggered, recomputes historical data and updates `cutoff_ts`.
-- **Periodic polling — A6:** Grafana refreshes dashboard panels every 10 seconds.
+    G4 --> G41["G4.1: Merge batch (<= cutoff_ts) and speed (> cutoff_ts)"]
+    G4 --> G42["G4.2: Display live 5s Grafana dashboard on EC2 :3000"]
