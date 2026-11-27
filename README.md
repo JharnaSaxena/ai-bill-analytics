@@ -105,17 +105,13 @@ G0  Accurate + fresh spend view with early warnings
 
 ## 5. Code Walkthrough (files, functions, constants)
 
-### 5.1 `producers/event_generator.py`: makes fake events
+### 5.1 `producers/event_generator.py`: Synthetic Traffic & Fault Simulator
 
-**Constants**
-
-- `STATUSES`: `success` (4 of 6), `rate_limited`, `error`
-- `APPS`: `chatbot`, `rag-search`, `summarizer`, `code-assistant`
-
-**Functions**
-
-- `load_prices(path)`: reads the price CSV and stops if it is empty.
-- `make_event(valid_rows, late_rate=0.02, bad_rate=0.005)`: builds one event for a random team and model; backdates it into 09:00 to 17:00 when run outside office hours; sometimes makes it late or invalid.
+* **Pricing-Driven Event Generation:** Loads valid `(team_id, model)` pairs from `price_budget.csv` (`load_prices()`) and constructs realistic LLM API usage events (`make_event()`) with unique UUIDs (`event_id`), token counts (`tokens_in`, `tokens_out`), app labels (`APPS`), and response statuses (`STATUSES`).
+* **Off-Hours Back-Dating:** Automatically shifts timestamps outside active operational hours into the `09:00–17:00 UTC` window so batch slot aggregations always receive valid data regardless of when the demo runs.
+* **Configurable Fault Injection:**
+  * **Late Arrivals (`late_rate=0.02`):** Shifts `2%` of events backward by `30–300 seconds` to stress-test Spark Streaming's `30s` event-time watermark.
+  * **Malformed Records (`bad_rate=0.005`):** Corrupts `0.5%` of events (missing `event_id`, negative `tokens_in`, or unknown `model`) to verify validation filters and `serving.dead_letter` routing.
 
 ### 5.2 `producers/producer.py`: sends events
 
