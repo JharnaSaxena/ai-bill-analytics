@@ -1,4 +1,4 @@
-# AI Bill Analytics: Concise Project Report
+# AI Bill Analytics
 
 *A Lambda Architecture for tracking LLM spend: Kafka, Spark, PostgreSQL and Grafana, all running locally in Docker.*
 
