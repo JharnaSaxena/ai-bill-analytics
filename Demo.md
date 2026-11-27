@@ -1,4 +1,4 @@
-# Live Demo Command Cheat Sheet (`demo.md`)
+# Live Demo Command sheet  (`demo.md`)
 
 | Phase / Window | Exact Command | What It Does |
 | :--- | :--- | :--- |
