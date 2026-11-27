@@ -1,14 +1,8 @@
 # AI Bill Analytics — AWS Architecture & Data Flow Guide
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![AWS](https://img.shields.io/badge/AWS-EC2%20%7C%20S3%20%7C%20Glue%204.0%20%7C%20Athena-orange.svg)](#)
-[![Streaming](https://img.shields.io/badge/Streaming-Apache%20Kafka%203.8.0-black.svg)](#)
-[![Database](https://img.shields.io/badge/Serving%20DB-PostgreSQL%2015-336791.svg)](#)
-[![Visualization](https://img.shields.io/badge/Dashboard-Grafana-F46800.svg)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![AWS](https://img.shields.io/badge/AWS-Glue%20%7C%20S3%20%7C%20Athena%20%7C%20EC2-orange)]() [![Streaming](https://img.shields.io/badge/Apache-Kafka%20KRaft-black)]() [![Database](https://img.shields.io/badge/PostgreSQL-15-blue)]() [![Visualization](https://img.shields.io/badge/Grafana-Live%20BI-F46800)]()
 
-End-to-end **Lambda Architecture** deployment on AWS for multi-tenant LLM token billing, cost reconciliation, and real-time budget alerting. All implementation scripts, SQL schemas, and Grafana provisioning configs reside in their respective repository folders (`AWS_Setup/`, `jobs/`, `producers/`, `db/init/`, `grafana/`).
-
----
+End-to-end **Lambda Architecture** on AWS for multi-tenant LLM token billing, cost reconciliation, and real-time budget alerting. All deployment runbooks and scripts live under `AWS_Setup/`, `local_project/jobs/`, `local_project/producers/`, `local_project/db/init/`, and `local_project/grafana/`.
 
 ## 1. End-to-End Architecture & Intermediate Artifacts Flowchart
 ```mermaid
@@ -60,41 +54,32 @@ flowchart TD
 ```
 
 ---
+## 2. Infrastructure & Stack
 
-## 2. Infrastructure & Machine Specifications
-
-| Component | AWS Service / Software | Configuration & Sizing | Purpose |
-| :--- | :--- | :--- | :--- |
-| **Compute Host** | Amazon EC2 | `t3.medium` (2 vCPU, 4 GiB RAM), Amazon Linux 2023 (`x86_64`), Region `us-east-1` | Runs Docker Compose stack (Kafka, PostgreSQL, Grafana) and Python ingestion/speed workers |
-| **Network & Firewall** | EC2 Security Group | Inbound TCP `22` (SSH) and TCP `3000` (Grafana UI) | Secures shell management and exposes live dashboard endpoint |
-| **IAM Permissions** | IAM Role / Instance Profile | `AmazonS3FullAccess`, `AWSGlueConsoleFullAccess`, `AmazonAthenaFullAccess` | Allows EC2 producers and Glue jobs to read/write S3 buckets and catalog tables |
-| **Object Storage** | Amazon S3 | Single bucket with 6 prefixes (`raw/`, `curated/`, `dead_letter/`, `scripts/`, `athena-results/`, `price/`) | Decouples raw ingestion landing from curated columnar analytics |
-| **Batch Compute** | AWS Glue `4.0` | Spark 3.3 / Python 3, `2` workers of type `G.1X` (4 vCPU, 16 GB RAM per worker) | Distributed deduplication, schema validation, pricing joins, and Parquet compaction |
-| **Metadata & SQL** | Glue Crawler + Athena | Catalog DB `ai_bill_db`, serverless Presto/Trino SQL engine | Automatically infers Parquet partition schemas (`dt=YYYY-MM-DD`) for ad-hoc SQL |
-| **Container Runtime** | Docker & Docker Compose | `postgres:15-alpine`, `apache/kafka:3.8.0` (KRaft mode), `grafana/grafana:latest` | Self-contained low-latency messaging, relational serving store, and visualization |
+| Component | Service / Stack | Configuration & Purpose |
+| :--- | :--- | :--- |
+| **Compute & Network** | Amazon EC2 (`us-east-1`) | `t3.medium` (2 vCPU, 4 GiB RAM, Amazon Linux 2023), SG inbound TCP `22` & `3000`, IAM role with S3, Glue, and Athena access. |
+| **Object Storage** | Amazon S3 | Single bucket partitioned into `raw/`, `curated/`, `dead_letter/`, `scripts/`, `athena-results/`, and `price/`. |
+| **Batch ETL & Catalog** | AWS Glue 4.0 + Athena | `2× G.1X` PySpark workers for dedup/validation/pricing; Glue Crawler (`ai_bill_db`) + Athena for SQL verification. |
+| **Serving & Streaming** | Docker Compose on EC2 | `postgres:15-alpine` (`:5432`), `apache/kafka:3.8.0` KRaft (`:9092`), and auto-provisioned `grafana/grafana` (`:3000`). |
 
 ---
 
-## 3. Intermediate Data Stages & Verification Checkpoints
+## 3. Data Pipeline Stages & Checkpoints
 
-| Stage | Location / Artifact | Format | Key Transformation & Verification Metric |
+| Stage | Artifact / Location | Format | Transformation & Verification |
 | :--- | :--- | :--- | :--- |
-| **Stage 1: Stream Buffer** | Kafka topic `llm-usage-events` | JSON | Decouples high-frequency event generation from downstream database writes |
-| **Stage 2: Raw Archive** | `s3://<BUCKET>/raw/dt=.../hour=.../` | `.jsonl` | Time-partitioned raw audit trail preserving every incoming `event_id` |
-| **Stage 3: Data Quality Split** | `s3://<BUCKET>/dead_letter/` vs `events_parquet/` | Snappy Parquet | Drops duplicate `event_id` rows and routes negative/null token records to DLQ |
-| **Stage 4: Batch Rollup** | `s3://<BUCKET>/curated/batch_agg_parquet/` | Snappy Parquet | Hourly aggregates (`slot_start`) with `DECIMAL(14,6)` cost precision |
-| **Stage 5: Cataloged Tables** | Athena DB `ai_bill_db` | Glue Catalog | Verifies row counts and total USD spend per `(team_id, model)` via SQL |
-| **Stage 6: Watermark Merge** | `serving.merged_view` (PostgreSQL) | SQL View | Combines `layer = 'batch'` up to `cutoff_ts` with `layer = 'speed'` after `cutoff_ts` with zero double-counting |
-| **Stage 7: Live Alerting** | `serving.budget_status` & Grafana (`:3000`) | Dashboard | Evaluates real-time spend against team caps (`team-a`: $500, `team-b`: $300, `team-c`: $200) |
+| **1. Ingest** | Kafka `llm-usage-events` & S3 `raw/` | JSON / `.jsonl` | Dual-write fan-out (`producer_and_archiver.py`) preserving identical `event_id` across both layers. |
+| **2. Clean & Split** | S3 `dead_letter/` vs `events_parquet/` | Snappy Parquet | Deduplicates `event_id` globally; isolates null/negative-token/unknown-model rows in DLQ (`glue_batch_etl.py`). |
+| **3. Batch Rollup** | S3 `curated/batch_agg_parquet/` & Athena `ai_bill_db` | Snappy Parquet | Hourly `slot_start` cost rollups (`DECIMAL(14,6)`) verified via Glue Crawler + Athena SQL. |
+| **4. Reconcile** | PostgreSQL `serving.merged_view` | SQL View | Merges `batch` (`≤ cutoff_ts`) + `speed` (`> cutoff_ts`) with zero overlap or double-counting. |
+| **5. Alert & BI** | `serving.budget_status` & Grafana (`:3000`) | Live Dashboard | Evaluates real-time spend against caps (`team-a` `$500`, `team-b` `$300`, `team-c` `$200`) with `80%`/`100%` alerts. |
 
 ---
 
-## 4. Operational Run Order (High-Level)
+## 4. Quickstart Execution (`AWS_Setup/`)
 
-1. **Provision Storage & Compute:** Create the S3 bucket prefixes and launch the `t3.medium` EC2 instance in `us-east-1` with ports `22` and `3000` open.
-2. **Start Local Serving Stack:** Configure `.env` with your bucket name and bring up PostgreSQL, Kafka, and Grafana via `docker compose up -d`.
-3. **Populate Raw & Batch Layers:** Run the event producer/archiver to populate `raw/`, execute the AWS Glue ETL job (`ai-bill-batch-etl`) and Crawler (`ai-bill-curated-crawler`), and verify `batch_agg_parquet` in Amazon Athena.
-4. **Reconcile & Stream Live:** Sync batch summaries and `cutoff_ts` into PostgreSQL, run the live speed consumer loop, and open `http://<EC2_PUBLIC_IP>:3000` (`admin` / `admin`) to monitor live metrics and threshold alerts.
-
-
-
+1. **Provision & Launch (`step-1` & `step-2`):** Create S3 prefixes + `ai_bill_db` catalog, launch EC2 (`t3.medium`, ports `22`/`3000`), and install Docker + Python dependencies (`boto3`, `kafka-python`, `psycopg2-binary`).
+2. **Start Serving Stack (`step-3` & `step-4`):** Upload `price_budget.csv` to S3, start Postgres/Kafka/Grafana via `docker compose up -d`, and deploy producer, speed, and Glue ETL scripts.
+3. **Run Batch & Sync (`step-5`):** Execute `ai-bill-batch-etl` (Glue) → run `ai-bill-curated-crawler` → audit in Athena → sync `batch_agg` + `cutoff_ts` to PostgreSQL.
+4. **Stream Live (`step-6` & `step-7`):** Run `demo_runner.py` to emit live traffic spikes, open `http://<EC2_PUBLIC_IP>:3000` (`admin` / `admin`), and run cleanup after demo.
