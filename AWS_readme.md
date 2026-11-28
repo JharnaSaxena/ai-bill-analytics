@@ -52,7 +52,7 @@ flowchart TD
     B6 --> V1
     SP3 --> V1
 ```
-
+<p align="center">⋆｡°✩ (˶ᵔ ᵕ ᵔ˶) ✩°｡⋆</p>
 ---
 ## 2. Infrastructure & Stack
 
@@ -64,7 +64,7 @@ flowchart TD
 | **Serving & Streaming** | Docker Compose on EC2 | `postgres:15-alpine` (`:5432`), `apache/kafka:3.8.0` KRaft (`:9092`), and auto-provisioned `grafana/grafana` (`:3000`). |
 
 ---
-
+<p align="center">⋆｡°✩ (˶ᵔ ᵕ ᵔ˶) ✩°｡⋆</p>
 ## 3. Data Pipeline Stages & Checkpoints
 
 | Stage | Artifact / Location | Format | Transformation & Verification |
@@ -76,6 +76,7 @@ flowchart TD
 | **5. Alert & BI** | `serving.budget_status` & Grafana (`:3000`) | Live Dashboard | Evaluates real-time spend against caps (`team-a` `$500`, `team-b` `$300`, `team-c` `$200`) with `80%`/`100%` alerts. |
 
 ---
+<p align="center">⋆｡°✩ (˶ᵔ ᵕ ᵔ˶) ✩°｡⋆</p>
 
 ## 4. Quickstart Execution (`AWS_Setup/`)
 
