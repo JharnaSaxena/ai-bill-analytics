@@ -1,6 +1,11 @@
 # AI Bill Analytics
 
 *A Lambda Architecture for tracking LLM spend: Kafka, Spark, PostgreSQL and Grafana, all running locally in Docker.*
+![Lambda](https://img.shields.io/badge/Architecture-Lambda-f9a8d4?style=flat-square)
+![Kafka](https://img.shields.io/badge/Streaming-Kafka-fde68a?style=flat-square&logo=apachekafka&logoColor=222)
+![Spark](https://img.shields.io/badge/Batch%20%26%20Stream-PySpark-fbcfe8?style=flat-square&logo=apachespark&logoColor=222)
+![Postgres](https://img.shields.io/badge/Serving-PostgreSQL-bae6fd?style=flat-square&logo=postgresql&logoColor=222)
+![Grafana](https://img.shields.io/badge/Dashboard-Grafana-ddd6fe?style=flat-square&logo=grafana&logoColor=222)
 
 ## 1. Problem and Business Value
 
